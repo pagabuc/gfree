@@ -1,0 +1,174 @@
+Only in ./llvm-3.8.0.src/include/llvm/CodeGen: AllocationOrder.h
+diff -ur ./llvm-naive/llvm-3.8.0.src/lib/CodeGen/AllocationOrder.h ./llvm-3.8.0.src/lib/CodeGen/AllocationOrder.h
+--- ./llvm-naive/llvm-3.8.0.src/lib/CodeGen/AllocationOrder.h	2015-07-16 00:16:00.000000000 +0200
++++ ./llvm-3.8.0.src/lib/CodeGen/AllocationOrder.h	2016-04-14 16:35:53.000000000 +0200
+@@ -26,7 +26,7 @@
+ class VirtRegMap;
+ class LiveRegMatrix;
+ 
+-class LLVM_LIBRARY_VISIBILITY AllocationOrder {
++class AllocationOrder {
+   SmallVector<MCPhysReg, 16> Hints;
+   ArrayRef<MCPhysReg> Order;
+   int Pos;
+diff -ur ./llvm-naive/llvm-3.8.0.src/lib/Target/X86/CMakeLists.txt ./llvm-3.8.0.src/lib/Target/X86/CMakeLists.txt
+--- ./llvm-naive/llvm-3.8.0.src/lib/Target/X86/CMakeLists.txt	2015-12-31 23:40:45.000000000 +0100
++++ ./llvm-3.8.0.src/lib/Target/X86/CMakeLists.txt	2016-04-14 16:15:02.000000000 +0200
+@@ -36,6 +36,12 @@
+   X86FixupLEAs.cpp
+   X86WinEHState.cpp
+   X86OptimizeLEAs.cpp
++  X86GFreeAssembler.cpp
++  X86GFreeImmediateRecon.cpp
++  X86GFreeModRMSIB.cpp
++  X86GFree.cpp
++  X86GFreeJCP.cpp
++  X86GFreeUtils.cpp
+   )
+ 
+ add_llvm_target(X86CodeGen ${sources})
+diff -ur ./llvm-naive/llvm-3.8.0.src/lib/Target/X86/X86AsmPrinter.cpp ./llvm-3.8.0.src/lib/Target/X86/X86AsmPrinter.cpp
+--- ./llvm-naive/llvm-3.8.0.src/lib/Target/X86/X86AsmPrinter.cpp	2015-12-25 23:09:45.000000000 +0100
++++ ./llvm-3.8.0.src/lib/Target/X86/X86AsmPrinter.cpp	2016-04-14 16:33:50.000000000 +0200
+@@ -12,6 +12,7 @@
+ //
+ //===----------------------------------------------------------------------===//
+ 
++#include "X86MCInstLower.h"
+ #include "X86AsmPrinter.h"
+ #include "InstPrinter/X86ATTInstPrinter.h"
+ #include "MCTargetDesc/X86BaseInfo.h"
+diff -ur ./llvm-naive/llvm-3.8.0.src/lib/Target/X86/X86AsmPrinter.h ./llvm-3.8.0.src/lib/Target/X86/X86AsmPrinter.h
+--- ./llvm-naive/llvm-3.8.0.src/lib/Target/X86/X86AsmPrinter.h	2015-10-15 16:09:59.000000000 +0200
++++ ./llvm-3.8.0.src/lib/Target/X86/X86AsmPrinter.h	2016-04-14 16:32:55.000000000 +0200
+@@ -17,7 +17,7 @@
+ #include "llvm/Target/TargetMachine.h"
+ 
+ // Implemented in X86MCInstLower.cpp
+-namespace {
++namespace llvm {
+   class X86MCInstLower;
+ }
+ 
+@@ -95,6 +95,9 @@
+     return "X86 Assembly / Object Emitter";
+   }
+ 
++  // Gfree 
++  void setSubtarget(const X86Subtarget *X86SubT) { Subtarget=X86SubT; }
++
+   const X86Subtarget &getSubtarget() const { return *Subtarget; }
+ 
+   void EmitStartOfAsmFile(Module &M) override;
+Only in ./llvm-3.8.0.src/lib/Target/X86: X86GFreeAssembler.cpp
+Only in ./llvm-3.8.0.src/lib/Target/X86: X86GFreeAssembler.h
+Only in ./llvm-3.8.0.src/lib/Target/X86: X86GFree.cpp
+Only in ./llvm-3.8.0.src/lib/Target/X86: X86GFreeImmediateRecon.cpp
+Only in ./llvm-3.8.0.src/lib/Target/X86: X86GFreeJCP.cpp
+Only in ./llvm-3.8.0.src/lib/Target/X86: X86GFreeModRMSIB.cpp
+Only in ./llvm-3.8.0.src/lib/Target/X86: X86GFreeUtils.cpp
+Only in ./llvm-3.8.0.src/lib/Target/X86: X86GFreeUtils.h
+diff -ur ./llvm-naive/llvm-3.8.0.src/lib/Target/X86/X86.h ./llvm-3.8.0.src/lib/Target/X86/X86.h
+--- ./llvm-naive/llvm-3.8.0.src/lib/Target/X86/X86.h	2016-01-13 12:30:44.000000000 +0100
++++ ./llvm-3.8.0.src/lib/Target/X86/X86.h	2016-04-14 16:15:31.000000000 +0200
+@@ -72,6 +72,13 @@
+ /// must run after prologue/epilogue insertion and before lowering
+ /// the MachineInstr to MC.
+ FunctionPass *createX86ExpandPseudoPass();
++
++// GFree Machine Pass
++FunctionPass *createGFreeImmediateReconPass();
++FunctionPass *createGFreeJCPPass();
++FunctionPass *createGFreeModRMSIB();
++FunctionPass *createGFreeMachinePass();
++
+ } // End llvm namespace
+ 
+ #endif
+diff -ur ./llvm-naive/llvm-3.8.0.src/lib/Target/X86/X86MCInstLower.cpp ./llvm-3.8.0.src/lib/Target/X86/X86MCInstLower.cpp
+--- ./llvm-naive/llvm-3.8.0.src/lib/Target/X86/X86MCInstLower.cpp	2016-01-05 08:44:14.000000000 +0100
++++ ./llvm-3.8.0.src/lib/Target/X86/X86MCInstLower.cpp	2016-04-14 16:34:29.000000000 +0200
+@@ -12,6 +12,7 @@
+ //
+ //===----------------------------------------------------------------------===//
+ 
++#include "X86MCInstLower.h"
+ #include "X86AsmPrinter.h"
+ #include "X86RegisterInfo.h"
+ #include "X86ShuffleDecodeConstantPool.h"
+@@ -40,34 +41,6 @@
+ #include "llvm/Support/TargetRegistry.h"
+ using namespace llvm;
+ 
+-namespace {
+-
+-/// X86MCInstLower - This class is used to lower an MachineInstr into an MCInst.
+-class X86MCInstLower {
+-  MCContext &Ctx;
+-  const MachineFunction &MF;
+-  const TargetMachine &TM;
+-  const MCAsmInfo &MAI;
+-  X86AsmPrinter &AsmPrinter;
+-public:
+-  X86MCInstLower(const MachineFunction &MF, X86AsmPrinter &asmprinter);
+-
+-  Optional<MCOperand> LowerMachineOperand(const MachineInstr *MI,
+-                                          const MachineOperand &MO) const;
+-  void Lower(const MachineInstr *MI, MCInst &OutMI) const;
+-
+-  MCSymbol *GetSymbolFromOperand(const MachineOperand &MO) const;
+-  MCOperand LowerSymbolOperand(const MachineOperand &MO, MCSymbol *Sym) const;
+-
+-private:
+-  MachineModuleInfoMachO &getMachOMMI() const;
+-  Mangler *getMang() const {
+-    return AsmPrinter.Mang;
+-  }
+-};
+-
+-} // end anonymous namespace
+-
+ // Emit a minimal sequence of nops spanning NumBytes bytes.
+ static void EmitNops(MCStreamer &OS, unsigned NumBytes, bool Is64Bit,
+                      const MCSubtargetInfo &STI);
+Only in ./llvm-3.8.0.src/lib/Target/X86: X86MCInstLower.h
+diff -ur ./llvm-naive/llvm-3.8.0.src/lib/Target/X86/X86TargetMachine.cpp ./llvm-3.8.0.src/lib/Target/X86/X86TargetMachine.cpp
+--- ./llvm-naive/llvm-3.8.0.src/lib/Target/X86/X86TargetMachine.cpp	2015-12-04 11:53:15.000000000 +0100
++++ ./llvm-3.8.0.src/lib/Target/X86/X86TargetMachine.cpp	2016-05-03 18:03:41.102731654 +0200
+@@ -208,6 +208,7 @@
+   bool addILPOpts() override;
+   bool addPreISel() override;
+   void addPreRegAlloc() override;
++  bool addPreRewrite() override;
+   void addPostRegAlloc() override;
+   void addPreEmitPass() override;
+   void addPreSched2() override;
+@@ -258,9 +259,16 @@
+     addPass(createX86OptimizeLEAs());
+ 
+   addPass(createX86CallFrameOptimization());
++  addPass(createGFreeImmediateReconPass());
++}
++
++bool X86PassConfig::addPreRewrite() {
++  addPass(createGFreeModRMSIB()); 
++  return true;
+ }
+ 
+ void X86PassConfig::addPostRegAlloc() {
++  addPass(createGFreeJCPPass());
+   addPass(createX86FloatingPointStackifierPass());
+ }
+ 
+@@ -277,4 +285,5 @@
+     addPass(createX86PadShortFunctions());
+     addPass(createX86FixupLEAs());
+   }
++  addPass(createGFreeMachinePass());
+ }
+Only in ./llvm-3.8.0.src/: llvm-config
+Binary files ./llvm-naive/llvm-3.8.0.src/utils/llvm-build/llvmbuild/componentinfo.pyc and ./llvm-3.8.0.src/utils/llvm-build/llvmbuild/componentinfo.pyc differ
+Binary files ./llvm-naive/llvm-3.8.0.src/utils/llvm-build/llvmbuild/configutil.pyc and ./llvm-3.8.0.src/utils/llvm-build/llvmbuild/configutil.pyc differ
+Binary files ./llvm-naive/llvm-3.8.0.src/utils/llvm-build/llvmbuild/__init__.pyc and ./llvm-3.8.0.src/utils/llvm-build/llvmbuild/__init__.pyc differ
+Binary files ./llvm-naive/llvm-3.8.0.src/utils/llvm-build/llvmbuild/main.pyc and ./llvm-3.8.0.src/utils/llvm-build/llvmbuild/main.pyc differ
+Binary files ./llvm-naive/llvm-3.8.0.src/utils/llvm-build/llvmbuild/util.pyc and ./llvm-3.8.0.src/utils/llvm-build/llvmbuild/util.pyc differ
